@@ -1,0 +1,6 @@
+# WGET
+http://www.swftools.org/swftools-2011-01-23-1815.tar.gz
+
+# tar xvzf ..
+# ./configure
+# convert  -colorspace RGB -quality 70 -density 120 mini_4k.pdf a.jpg
