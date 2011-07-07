@@ -13,12 +13,15 @@ import datetime
 import uuid
 import shutil
 import re
+import urllib
 
 from kombu import BrokerConnection
 from Queue import Empty
 
 import subprocess
 import eventlet
+from eventlet.green import urllib2
+
 eventlet.monkey_patch()
 
 # General config
@@ -181,8 +184,17 @@ class TaskProcessor(object):
         self.file_name = self.task['file_name']
         self.sender = self.task['sender']
         self.upload_to = self.task['upload_to']
+        self.callback = self.task['callback']
+
         # Path were the pdf received from file_content is written
         self.base_path = cfg['media_path']
+
+        self.callback_payload = {
+            "success": False,
+            "imgs_path": [],
+            "nbr_pages": -1,
+            "msg": "",
+        }
 
     def _create_today_folder_on(self, bpath):
         """
@@ -249,6 +261,7 @@ class TaskProcessor(object):
         # Count pages
         try:
             nbr_pages = PDFToolkit.count_pages(self.pdf_source_path)
+            self.callback_payload['nbr_pages'] = nbr_pages
         except PDFIntrospectException, e:
             self.handle_error("[Error] cant' count pages ", e)
             return
@@ -257,10 +270,14 @@ class TaskProcessor(object):
         source_imgs_path = ["%s_large_-%s.jpg" % (self.pdf_source_path, i) for i in range(0, int(nbr_pages))]
         try:
             upload_path = self._create_today_folder_on(bpath=self.upload_to)
+            destination_paths = []
             for source_img_path in source_imgs_path:
                 # build destionation file name
                 destination_img_path = "%s/%s" % (upload_path, source_img_path.split('/')[-1])
                 shutil.move(source_img_path, destination_img_path)
+                # append new path minus upload_to
+                destination_paths.append(destination_img_path.replace(self.upload_to,""))
+            self.callback_payload['imgs_path'] = destination_paths
         except OSError, e:
             self.handle_error("[Error] moving new img files %s", e)
             return
@@ -272,21 +289,27 @@ class TaskProcessor(object):
             self.handle_error("[Error] deleting source pdf %s", e)
             return
         
+        self.do_success_callback(self.callback_payload)
+
         mainLogger.debug("Convertion done")
         self.msg.ack() 
         
     def handle_error(self, msg):
         mainLogger.info(msg)
-        self.do_error_callback(msg=msg)
+        self.do_error_callback(msg=msg, data=self.callback_payload)
 
-    def do_error_callback(self, msg):
-        pass
+    def do_error_callback(self, msg, data):
+        self.callback_payload["msg"] = msg
+        self.do_call_back(False, self.callback_payload)
 
-    def do_success_callback(self, msg):
-        pass
+    def do_success_callback(self, data):
+        self.do_call_back(True, self.callback_payload)
 
-    def do_call_back(self, succes, data):
-        pass
+    def do_call_back(self, success, data):
+        self.callback_payload["success"] = success
+        data = urllib.urlencode(self.callback_payload)
+        req = urllib2.Request(self.callback, data)
+        urllib2.urlopen(req)
 
 
 # Control of daemon     
