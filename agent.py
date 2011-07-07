@@ -1,6 +1,8 @@
 from daemon import Daemon
+from pdftoolkit import PDFToolkit, PDFIntrospectException
 from logging import handlers
 
+import json
 import os
 import errno
 import sys
@@ -8,6 +10,9 @@ import logging
 import time
 import ConfigParser
 import datetime
+import uuid
+import shutil
+import re
 
 from kombu import BrokerConnection
 from Queue import Empty
@@ -47,7 +52,6 @@ try:
     agentConfig['redis_port'] = config.get('Main', 'redis_port')
     agentConfig['redis_db'] = config.get('Main', 'redis_db')
     agentConfig['queue_name'] = config.get('Main', 'queue_name')
-
  
     # Tmp path
     if os.path.exists('/var/log/pdfconverter-agent/'):
@@ -84,7 +88,7 @@ try:
         except KeyError, ex:
             agentConfig['logging'] = logging.INFO
 
-      
+
 except ConfigParser.NoSectionError, e:
     print 'Config file not found or incorrectly formatted'
     print 'Agent will now quit'
@@ -148,48 +152,141 @@ class Consumer(object):
         Spawn a green thread
         """
         message = self.queue.get(block=True, timeout=1)
-        mainLogger.debug("Consuming")
-
-        self.pool.spawn_n(self.convert_pdf_to_img, message)
+        mainLogger.debug("Got a task !")
+        self.pool.spawn_n(self.process, message, agentConfig)
       
+    def process(self, msg, cfg):
+        proc = TaskProcessor(msg, cfg)
+        proc.run()
+   
  
-    def convert_pdf_to_img(self, msg):
+    def close(self):
+        self.queue.close()
+
+class TaskProcessor(object):
+    """
+    Task processor
+    """
+    def __init__(self, msg, cfg):
         """
-        Convert to PDF
+         Message has:
+        -  file_content (binary)
+        -  file_name
+        -  sender
+        -  upload_to (where to upload)
         """
-        base_path = agentConfig['media_path']
-        mainLogger.debug("Got task")
-        task = msg.payload
-        # Save pdf
-        # 1. create today's folder
+        self.msg = msg
+        self.task = msg.payload
+        self.file_content = self.task['file_content']
+        self.file_name = self.task['file_name']
+        self.sender = self.task['sender']
+        self.upload_to = self.task['upload_to']
+        # Path were the pdf received from file_content is written
+        self.base_path = cfg['media_path']
+
+    def _create_today_folder_on(self, bpath):
+        """
+        Create a folder with todays date as name on path P
+        """
         today = datetime.date.today()
         todaystr = today.isoformat()
-
-        img_dir_path = "%s%s" % (base_path, todaystr)
-        if not os.path.exists(img_dir_path):
+        path = "%s%s" % (bpath, todaystr)
+        if not os.path.exists(path):
             try:
-                os.mkdir(img_dir_path)
+                os.mkdir(path)
             except OSError as exc:
                 if exc.errno == errno.EEXIST:
                     pass
                 else: raise
-        # get file path
-        file_path = '%s/%s' % (img_dir_path, task['file_name'])
-        pdf_file = open(file_path, "w", 0)
-        pdf_file.writelines(task['file_content'])
+        return path
+
+    @property
+    def unique_file_name(self):
+        """
+        Build Unique File name 
+        """
+        new_file_name = "%s_%s_%s".strip() % (
+            uuid.uuid4(), 
+            self.sender, 
+            self.file_name
+        )
+        return re.sub(r'\s', '', new_file_name)
+
+
+    def _save_payload_file(self, path):
+        """
+        Write payload file to disk
+        """
+        self.pdf_source_path = '%s/%s' % (path, self.unique_file_name)
+        pdf_file = open(self.pdf_source_path, "w", 0)
+        pdf_file.writelines(self.file_content)
         pdf_file.close()
 
-        # Call convert
-        command = "convert -colorspace RGB -quality 70 -density 120 %s %s" % (file_path, file_path + ".jpg")
+    
+    def _convert_pdf_to_img(self, ext='jpg'):
+        # Call convert to build large imgs
+        command = "convert -colorspace RGB -quality 70 -density 120 %s %s" % (
+            self.pdf_source_path, 
+            self.pdf_source_path + "_large_.%s" % ext
+        )
         output, error = subprocess.Popen(
                             command.split(' '), stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE).communicate()
-       
-        mainLogger.debug("Convertion done")
-        msg.ack() # remove message from queue
+        return output, error
 
-    def close(self):
-        self.queue.close()
+    def run(self):
+        # Create today's folder if needed
+        path = self._create_today_folder_on(bpath=self.base_path)
+        # Write file from task to disk
+        self._save_payload_file(path)
+
+        # Call convert on pdf
+        output, error = self._convert_pdf_to_img()
+        if error:
+            self.handle_error("[Error] converting pdf to img ", error)
+            return 
+
+        # Count pages
+        try:
+            nbr_pages = PDFToolkit.count_pages(self.pdf_source_path)
+        except PDFIntrospectException, e:
+            self.handle_error("[Error] cant' count pages ", e)
+            return
+
+        # Move created imgs to upload_to dir
+        source_imgs_path = ["%s_large_-%s.jpg" % (self.pdf_source_path, i) for i in range(0, int(nbr_pages))]
+        try:
+            upload_path = self._create_today_folder_on(bpath=self.upload_to)
+            for source_img_path in source_imgs_path:
+                # build destionation file name
+                destination_img_path = "%s/%s" % (upload_path, source_img_path.split('/')[-1])
+                shutil.move(source_img_path, destination_img_path)
+        except OSError, e:
+            self.handle_error("[Error] moving new img files %s", e)
+            return
+ 
+        # Delete source pdf
+        try:
+            os.remove(self.pdf_source_path)
+        except OSError, e:
+            self.handle_error("[Error] deleting source pdf %s", e)
+            return
+        
+        mainLogger.debug("Convertion done")
+        self.msg.ack() 
+        
+    def handle_error(self, msg):
+        mainLogger.info(msg)
+        self.do_error_callback(msg=msg)
+
+    def do_error_callback(self, msg):
+        pass
+
+    def do_success_callback(self, msg):
+        pass
+
+    def do_call_back(self, succes, data):
+        pass
 
 
 # Control of daemon     
