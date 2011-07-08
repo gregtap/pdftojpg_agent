@@ -185,15 +185,22 @@ class TaskProcessor(object):
         self.sender = self.task['sender']
         self.upload_to = self.task['upload_to']
         self.callback = self.task['callback']
+        self.sae_id = self.task['sae_id']
 
         # Path were the pdf received from file_content is written
         self.base_path = cfg['media_path']
 
         self.callback_payload = {
             "success": False,
-            "imgs_path": [],
+            "imgs_path": {},
             "nbr_pages": -1,
             "msg": "",
+        }
+
+        self.sizes = {
+            'large': 1000,
+            'normal': 700,
+            'thumbnail': 180
         }
 
     def _create_today_folder_on(self, bpath):
@@ -203,13 +210,17 @@ class TaskProcessor(object):
         today = datetime.date.today()
         todaystr = today.isoformat()
         path = "%s%s" % (bpath, todaystr)
+        return self._create_folder(path)
+        
+
+    def _create_folder(self, path):
         if not os.path.exists(path):
             try:
                 os.mkdir(path)
             except OSError as exc:
                 if exc.errno == errno.EEXIST:
                     pass
-                else: raise
+                else: raise   
         return path
 
     @property
@@ -217,11 +228,7 @@ class TaskProcessor(object):
         """
         Build Unique File name 
         """
-        new_file_name = "%s_%s_%s".strip() % (
-            uuid.uuid4(), 
-            self.sender, 
-            self.file_name
-        )
+        new_file_name = self.file_name
         return re.sub(r'\s', '', new_file_name)
 
 
@@ -235,11 +242,12 @@ class TaskProcessor(object):
         pdf_file.close()
 
     
-    def _convert_pdf_to_img(self, ext='jpg'):
+    def _convert_pdf_to_img(self, size="large", ext='jpg'):
         # Call convert to build large imgs
-        command = "convert -colorspace RGB -quality 70 -density 120 %s %s" % (
+        command = "convert -colorspace RGB -quality 70 -resize %sx -density 120 %s %s" % (
+            self.sizes[size],
             self.pdf_source_path, 
-            self.pdf_source_path + "_large_.%s" % ext
+            self.pdf_source_path + "_%s_.%s" % (size, ext)
         )
         output, error = subprocess.Popen(
                             command.split(' '), stdout=subprocess.PIPE,
@@ -249,14 +257,18 @@ class TaskProcessor(object):
     def run(self):
         # Create today's folder if needed
         path = self._create_today_folder_on(bpath=self.base_path)
+        # Then create a folder with sae_id as name inside
+        path = self._create_folder('%s/%s' % (path, self.sae_id))
+       
         # Write file from task to disk
         self._save_payload_file(path)
 
         # Call convert on pdf
-        output, error = self._convert_pdf_to_img()
-        if error:
-            self.handle_error("[Error] converting pdf to img ", error)
-            return 
+        for size in list(self.sizes):
+            output, error = self._convert_pdf_to_img(size=size)
+            if error:
+                self.handle_error("[Error] converting pdf to img ", error)
+                return 
 
         # Count pages
         try:
@@ -267,17 +279,29 @@ class TaskProcessor(object):
             return
 
         # Move created imgs to upload_to dir
-        source_imgs_path = ["%s_large_-%s.jpg" % (self.pdf_source_path, i) for i in range(0, int(nbr_pages))]
+        source_imgs_path = {
+            'large': ["%s_%s_-%s.jpg" % (self.pdf_source_path, 'large', i) for i in range(0, int(nbr_pages))],
+            'normal': ["%s_%s_-%s.jpg" % (self.pdf_source_path, 'normal', i) for i in range(0, int(nbr_pages))],
+            'thumbnail': ["%s_%s_-%s.jpg" % (self.pdf_source_path, 'thumbnail', i) for i in range(0, int(nbr_pages))]
+        }
+       
         try:
+            # Create destination folder
             upload_path = self._create_today_folder_on(bpath=self.upload_to)
+            # Then create a folder with sae_id as name inside
+            upload_path = self._create_folder('%s/%s' % (upload_path, self.sae_id))
+                      
             destination_paths = []
-            for source_img_path in source_imgs_path:
-                # build destionation file name
-                destination_img_path = "%s/%s" % (upload_path, source_img_path.split('/')[-1])
-                shutil.move(source_img_path, destination_img_path)
-                # append new path minus upload_to
-                destination_paths.append(destination_img_path.replace(self.upload_to,""))
-            self.callback_payload['imgs_path'] = destination_paths
+            for k, source_img_path in source_imgs_path.iteritems():
+                destination_paths = []
+                for img_path in source_img_path:
+                    # build destionation file name
+                    destination_img_path = "%s/%s" % (upload_path, img_path.split('/')[-1])
+
+                    shutil.move(img_path, destination_img_path)
+                    # append new path minus upload_to
+                    destination_paths.append(destination_img_path.replace(self.upload_to,""))
+                self.callback_payload['imgs_path'][k] = destination_paths
         except OSError, e:
             self.handle_error("[Error] moving new img files %s", e)
             return
